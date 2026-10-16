@@ -6,10 +6,11 @@ export type ChildConfig = {
   transport: 'stdio' | 'streamable-http'; command?: string; args?: string[]; cwd?: string;
   url?: string; headers?: Record<string, string>; env?: Record<string, string>;
   watch?: string[]; build?: { command: string; args?: string[] };
-  restartDebounceMs?: number; startupTimeoutMs?: number; toolTimeoutMs?: number; maxRestartAttempts?: number;
+  restartDebounceMs?: number; startupTimeoutMs?: number; toolTimeoutMs?: number; maxRestartAttempts?: number; reloadDrainTimeoutMs?: number;
 };
 export type Config = { version: 1; servers: Record<string, ChildConfig>; codexControl?: { url?: string; socketPath?: string } };
-export const configPath = () => process.env.CODEX_MCP_HOTLOAD_CONFIG ?? join(homedir(), '.codex-mcp-hotload', 'config.json');
+const legacyConfigPath = () => join(homedir(), '.codex-mcp-hotload', 'config.json');
+export const configPath = () => process.env.HOTLOAD_MCP_CONFIG ?? process.env.CODEX_MCP_HOTLOAD_CONFIG ?? join(homedir(), '.hotload-mcp', 'config.json');
 
 export async function readConfig(path = configPath()): Promise<Config> {
   try {
@@ -26,10 +27,16 @@ export async function readConfig(path = configPath()): Promise<Config> {
       if (server.transport === 'stdio' && !server.command) throw new Error(`stdio server ${name} needs a command`);
       if (server.transport === 'streamable-http' && !server.url) throw new Error(`HTTP server ${name} needs a URL`);
       if (server.url && !['http:', 'https:'].includes(new URL(server.url).protocol)) throw new Error(`invalid URL for ${name}`);
+      if (server.reloadDrainTimeoutMs !== undefined && (!Number.isSafeInteger(server.reloadDrainTimeoutMs) || server.reloadDrainTimeoutMs < 0)) throw new Error(`reloadDrainTimeoutMs for ${name} must be a non-negative integer`);
     }
     return value;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { version: 1, servers: {} };
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      if (path === configPath() && path !== legacyConfigPath()) {
+        try { return await readConfig(legacyConfigPath()); } catch (legacyError) { if (!(legacyError as NodeJS.ErrnoException).message.startsWith(`Invalid config ${legacyConfigPath()}: ENOENT`)) throw legacyError; }
+      }
+      return { version: 1, servers: {} };
+    }
     throw new Error(`Invalid config ${path}: ${(error as Error).message}`);
   }
 }

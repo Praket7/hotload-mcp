@@ -1,7 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import { z } from 'zod';
-import type { Manager } from './manager.js';
+import { ChildCallError, type Manager } from './manager.js';
 import { searchTools, validateArguments } from './core.js';
 import { listMcpServers, CodexAppServer, nativeReload, type CodexEndpoint } from './codex.js';
 import { homedir } from 'node:os';
@@ -17,6 +17,7 @@ const unavailableChild = (manager: Manager, name: string) => {
   const maximum = status?.maxRestartAttempts ?? 5;
   const exhausted = status?.state === 'failed' && attempts >= maximum;
   const pending = ['crash_backoff', 'restarting', 'starting'].includes(status?.state ?? '');
+  if (status?.state === 'draining') return fail('RELOAD_IN_PROGRESS', `${name} is draining active calls before reload. Retry after the reload completes.`, { server: name, retryable: true });
   return fail(exhausted ? 'RECOVERY_EXHAUSTED' : 'SERVER_UNAVAILABLE', exhausted
     ? `Automatic recovery for ${name} is exhausted after ${attempts} of ${maximum} attempts. Stop calling this child. Fix it, then use hotload_reload_server to try again.`
     : pending
@@ -38,7 +39,7 @@ export function createServer(manager: Manager) {
     const config = await readConfig();
     return config.codexControl ?? { socketPath: join(process.env.CODEX_HOME ?? join(homedir(), '.codex'), 'app-server-control', 'app-server-control.sock') };
   };
-  const server = new McpServer({ name: 'codex-mcp-hotload', version: '0.2.4' });
+  const server = new McpServer({ name: 'hotload-mcp', version: '0.3.0' });
   server.registerTool('hotload_list_servers', { description: 'List Hotload child servers and MCP servers configured directly in Codex.', inputSchema: {} }, async () => {
     await manager.refreshConfig();
     const local = manager.status();
@@ -77,8 +78,11 @@ export function createServer(manager: Manager) {
     if (expectedSchemaHash !== record.schemaHash) return fail('STALE_SCHEMA', 'Tool definition has changed. Search again and review its current definition before calling it.', { oldSchemaHash: expectedSchemaHash, current: { name: record.name, ...(record.title ? { title: record.title } : {}), ...(record.description ? { description: record.description } : {}), schemaHash: record.schemaHash, inputSchema: record.inputSchema, outputSchema: record.outputSchema ?? {} } });
     const errors = validateArguments(record.inputSchema, args); if (errors.length) return fail('INVALID_ARGUMENTS', errors.join('; '), { schemaHash: record.schemaHash });
     const client = manager.getClient(name); if (!client) return unavailableChild(manager, name);
-    try { const result = await withTimeout(client.callTool({ name: toolName, arguments: args }), manager.toolTimeout(name)); return text({ server: name, tool: toolName, schemaHash: record.schemaHash, result }); }
-    catch (error) { return manager.status().find((item) => item.name === name)?.state === 'ready' ? fail('CALL_FAILED', (error as Error).message) : unavailableChild(manager, name); }
+    try { const result = await withTimeout(manager.callTool(name, toolName, args), manager.toolTimeout(name)); return text({ server: name, tool: toolName, schemaHash: record.schemaHash, result }); }
+    catch (error) {
+      if (error instanceof ChildCallError) return fail(error.code, error.message, { server: name, retryable: error.code !== 'CALL_INTERRUPTED_BY_RELOAD' });
+      return manager.status().find((item) => item.name === name)?.state === 'ready' ? fail('CALL_FAILED', (error as Error).message) : unavailableChild(manager, name);
+    }
   });
   return server;
 }

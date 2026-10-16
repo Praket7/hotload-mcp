@@ -9,15 +9,18 @@ import { canonicalJson, Registry } from './core.js';
 const DEFAULT_MAX_RESTART_ATTEMPTS = 5;
 const logCatalogEvent = (event: string, details: Record<string, unknown>) => process.stderr.write(`${JSON.stringify({ event, timestamp: new Date().toISOString(), ...details })}\n`);
 const sorted = (names: string[]) => [...names].sort();
-type Managed = { config: ChildConfig; client: Client | undefined;  watcher: FSWatcher | undefined; state: string; lastReload: string | undefined; lastError: string | undefined; stderr: string[]; restartCount: number; startedAt: number | undefined; recoveryAttempt: number; recoveryTimer: NodeJS.Timeout | undefined; lock: Promise<unknown> };
+type ActiveCall = { controller: AbortController; done: Promise<void>; finish: () => void; reason?: 'reload' | 'disconnect' };
+type Managed = { config: ChildConfig; client: Client | undefined; watcher: FSWatcher | undefined; state: string; lastReload: string | undefined; lastError: string | undefined; stderr: string[]; restartCount: number; startedAt: number | undefined; recoveryAttempt: number; recoveryTimer: NodeJS.Timeout | undefined; lock: Promise<unknown>; activeCalls: Map<string, ActiveCall>; generation: number };
+export class ChildCallError extends Error { constructor(readonly code: 'CALL_INTERRUPTED_BY_RELOAD' | 'CHILD_DISCONNECTED' | 'RELOAD_IN_PROGRESS', message: string) { super(message); } }
 
 export class Manager {
   readonly registry = new Registry();
   readonly #servers = new Map<string, Managed>();
   #configSync: Promise<void> = Promise.resolve();
   constructor(readonly definitions: Record<string, ChildConfig>) {
-    for (const [name, config] of Object.entries(definitions)) this.#servers.set(name, { config, client: undefined, watcher: undefined, state: 'stopped', lastReload: undefined, lastError: undefined, stderr: [], restartCount: 0, startedAt: undefined, recoveryAttempt: 0, recoveryTimer: undefined, lock: Promise.resolve() });
+    for (const [name, config] of Object.entries(definitions)) this.#servers.set(name, this.#newManaged(config));
   }
+  #newManaged(config: ChildConfig): Managed { return { config, client: undefined, watcher: undefined, state: 'stopped', lastReload: undefined, lastError: undefined, stderr: [], restartCount: 0, startedAt: undefined, recoveryAttempt: 0, recoveryTimer: undefined, lock: Promise.resolve(), activeCalls: new Map(), generation: 0 }; }
   names() { return [...this.#servers.keys()]; }
   refreshConfig() {
     const operation = this.#configSync.then(async () => {
@@ -33,7 +36,7 @@ export class Manager {
       for (const [name, config] of Object.entries(latest)) {
         const existing = this.#servers.get(name);
         if (!existing) {
-          this.#servers.set(name, { config, client: undefined, watcher: undefined, state: 'stopped', lastReload: undefined, lastError: undefined, stderr: [], restartCount: 0, recoveryAttempt: 0, recoveryTimer: undefined, startedAt: undefined, lock: Promise.resolve() });
+          this.#servers.set(name, this.#newManaged(config));
           reload.add(name);
         } else if (canonicalJson(existing.config) !== canonicalJson(config)) {
           existing.config = config;
@@ -54,8 +57,11 @@ export class Manager {
       const startedAt = Date.now();
       const beforeCount = this.registry.list(name).length;
       let diff: ReturnType<Registry['replace']> | undefined;
-      server.state = build && server.config.build ? 'building' : 'restarting';
+      server.state = 'draining';
       try {
+        await this.#drain(server, server.config.reloadDrainTimeoutMs ?? 5000);
+        server.generation++;
+        server.state = build && server.config.build ? 'building' : 'restarting';
         if (build && server.config.build) await this.#runBuild(server);
         await this.#stop(server, name);
         server.state = 'starting';
@@ -79,10 +85,17 @@ export class Manager {
     return operation;
   }
   async #connect(server: Managed): Promise<{ client: Client }> {
-    const client = new Client({ name: 'codex-mcp-hotload', version: '0.2.6' });
+    const name = this.#name(server);
+    let client!: Client;
+    client = new Client({ name: 'hotload-mcp', version: '0.3.0' }, { versionNegotiation: { mode: 'auto' }, listChanged: { tools: { onChanged: (error, tools) => {
+      if (error || !tools || server.client !== client || server.state !== 'ready') return;
+      const beforeCount = this.registry.list(name).length;
+      const diff = this.registry.replace(name, tools.map((tool) => ({ name: tool.name, ...(tool.title ? { title: tool.title } : {}), ...(tool.description ? { description: tool.description } : {}), inputSchema: tool.inputSchema as Record<string, unknown>, ...(tool.outputSchema ? { outputSchema: tool.outputSchema as Record<string, unknown> } : {}) })));
+      if (diff.added.length || diff.removed.length || diff.changed.length) logCatalogEvent('mcp.catalog.changed', { server: name, beforeCount, afterCount: tools.length, added: sorted(diff.added), removed: sorted(diff.removed), changed: sorted(diff.changed), revision: diff.revision });
+    } } } });
     if (server.config.transport === 'stdio') {
       const transport = new StdioClientTransport({ command: server.config.command!, args: server.config.args ?? [], ...(server.config.cwd ? { cwd: server.config.cwd } : {}), env: Object.fromEntries(Object.entries({ ...process.env, ...server.config.env }).filter((entry): entry is [string, string] => entry[1] !== undefined)) });
-      transport.onclose = () => { if (server.state === 'ready' && server.client) { server.client = undefined; server.state = 'crash_backoff'; server.lastError = 'Child MCP connection closed unexpectedly'; const name = this.#name(server); const beforeCount = this.registry.list(name).length; const diff = this.registry.replace(name, []); logCatalogEvent('mcp.catalog.unavailable', { server: name, reason: 'child_disconnected', beforeCount, afterCount: 0, removed: sorted(diff.removed), revision: diff.revision }); this.#scheduleRecovery(name, server); } };
+      transport.onclose = () => { if (server.state === 'ready' && server.client) { this.#abortCalls(server, 'disconnect'); server.client = undefined; server.state = 'crash_backoff'; server.lastError = 'Child MCP connection closed unexpectedly'; const beforeCount = this.registry.list(name).length; const diff = this.registry.replace(name, []); logCatalogEvent('mcp.catalog.unavailable', { server: name, reason: 'child_disconnected', beforeCount, afterCount: 0, removed: sorted(diff.removed), revision: diff.revision }); this.#scheduleRecovery(name, server); } };
       transport.stderr?.on('data', (chunk: Buffer) => this.#recordStderr(server, chunk.toString()));
       try { await withTimeout(client.connect(transport), server.config.startupTimeoutMs ?? 10_000, `Starting ${this.#name(server)}`); } catch (error) { await client.close().catch(() => undefined); throw error; }
       return { client };
@@ -119,10 +132,44 @@ export class Manager {
     server.state = 'stopped';
     if (name) void name;
   }
+  async #drain(server: Managed, timeoutMs: number) {
+    if (!server.activeCalls.size) return;
+    let timer: NodeJS.Timeout;
+    await Promise.race([Promise.all([...server.activeCalls.values()].map((call) => call.done)), new Promise<void>((resolve) => { timer = setTimeout(resolve, timeoutMs); })]).finally(() => clearTimeout(timer!));
+    if (server.activeCalls.size) {
+      this.#abortCalls(server, 'reload');
+      await server.client?.close().catch(() => undefined);
+      server.client = undefined;
+    }
+    await Promise.all([...server.activeCalls.values()].map((call) => call.done));
+  }
+  #abortCalls(server: Managed, reason: 'reload' | 'disconnect') {
+    for (const call of server.activeCalls.values()) { call.reason = reason; call.controller.abort(); }
+  }
+  async callTool(name: string, tool: string, args: Record<string, unknown>) {
+    const server = this.#servers.get(name);
+    if (!server || !server.client || server.state !== 'ready') throw new ChildCallError(server?.state === 'draining' ? 'RELOAD_IN_PROGRESS' : 'CHILD_DISCONNECTED', `Child ${name} is not ready`);
+    const generation = server.generation;
+    const callId = `${generation}:${Date.now()}:${Math.random()}`;
+    const active: ActiveCall = { controller: new AbortController(), done: Promise.resolve(), finish: () => undefined };
+    active.done = new Promise<void>((resolve) => { active.finish = resolve; });
+    server.activeCalls.set(callId, active);
+    try {
+      const result = await server.client.callTool({ name: tool, arguments: args }, { signal: active.controller.signal });
+      if (active.reason === 'reload') throw new ChildCallError('CALL_INTERRUPTED_BY_RELOAD', `Call to ${name}.${tool} was interrupted by reload`);
+      if (active.reason === 'disconnect') throw new ChildCallError('CHILD_DISCONNECTED', `Child ${name} disconnected during the call`);
+      return result;
+    }
+    catch (error) {
+      if (active.reason === 'reload') throw new ChildCallError('CALL_INTERRUPTED_BY_RELOAD', `Call to ${name}.${tool} was interrupted by reload`);
+      if (active.reason === 'disconnect' || server.generation !== generation) throw new ChildCallError('CHILD_DISCONNECTED', `Child ${name} disconnected during the call`);
+      throw error;
+    } finally { server.activeCalls.delete(callId); active.finish(); }
+  }
   async stop(name: string) { const server = this.#servers.get(name); if (server) await this.#stop(server, name); }
   getClient(name: string) { return this.#servers.get(name)?.client; }
   toolTimeout(name: string) { return this.#servers.get(name)?.config.toolTimeoutMs ?? 60_000; }
-  status() { return [...this.#servers.entries()].map(([name, s]) => ({ name, state: s.state, transport: s.config.transport, revision: this.registry.list(name)[0]?.revision ?? 0, toolCount: this.registry.list(name).length, lastReload: s.lastReload ?? null, lastError: s.lastError ?? null, restartCount: s.restartCount, recoveryAttempt: s.recoveryAttempt, maxRestartAttempts: s.config.maxRestartAttempts ?? DEFAULT_MAX_RESTART_ATTEMPTS, uptimeMs: s.startedAt ? Date.now() - s.startedAt : null, watch: Boolean(s.watcher), stderrTail: s.stderr.join('').slice(-2000) })); }
+  status() { return [...this.#servers.entries()].map(([name, s]) => ({ name, state: s.state, transport: s.config.transport, revision: this.registry.list(name)[0]?.revision ?? 0, toolCount: this.registry.list(name).length, activeCallCount: s.activeCalls.size, generation: s.generation, lastReload: s.lastReload ?? null, lastError: s.lastError ?? null, restartCount: s.restartCount, recoveryAttempt: s.recoveryAttempt, maxRestartAttempts: s.config.maxRestartAttempts ?? DEFAULT_MAX_RESTART_ATTEMPTS, uptimeMs: s.startedAt ? Date.now() - s.startedAt : null, watch: Boolean(s.watcher), stderrTail: s.stderr.join('').slice(-2000) })); }
   async watch(name: string) {
     const server = this.#servers.get(name); if (!server) throw new Error(`Unknown server: ${name}`);
     if (!server.config.watch?.length) throw new Error(`${name} has no watch patterns; configure watch in config.json`);

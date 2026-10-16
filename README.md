@@ -1,82 +1,117 @@
-# Codex MCP Hotload
+# Hotload MCP
 
-![Codex MCP Hotload connects one stable gateway to changing MCP servers](docs/images/gateway.png)
+Hotload MCP is a stable MCP gateway for developing child MCP servers. Codex and Claude Code connect to the same fixed Hotload tools while Hotload reloads children and refreshes their catalogs.
 
-Develop MCP servers while keeping one stable connection in Codex. Add a server, rebuild it, and discover its current tools from the same conversation.
+Use Node.js 20 or newer. Version 0.3.0 adds safe reload draining and cancellation, child `tools/list_changed` support, and a Claude Code project installer. The default gateway remains stable for both clients.
 
-## Download version 0.2.6
+## Install
 
-Use Node.js 20 or newer. Codex will download and run the exact npm release from the configuration below. Version 0.2.6 logs tool counts and added, removed, or changed names for each Hotload child reload, and records mid-session child removal. Pinning the version keeps future releases from changing your setup unexpectedly.
-
-To install the same version globally for terminal use, run this command.
+Run the CLI directly with `npx` or install it globally:
 
 ```bash
-npm install --global codex-mcp-hotload@0.2.6
+npm install --global hotload-mcp@0.3.0
+hotload-mcp --help
 ```
+
+Hotload stores its configuration at `~/.hotload-mcp/config.json`. Set `HOTLOAD_MCP_CONFIG` to use another file. The previous `CODEX_MCP_HOTLOAD_CONFIG` environment variable and `~/.codex-mcp-hotload/config.json` location remain supported for existing installations.
 
 ## Connect Codex
 
-Add this server entry to your Codex configuration file at `~/.codex/config.toml`.
+Add this entry to `~/.codex/config.toml`:
 
 ```toml
-[mcp_servers.codex-mcp-hotload]
+[mcp_servers.hotload-mcp]
 command = "npx"
-args = ["--yes", "codex-mcp-hotload@0.2.6", "serve"]
+args = ["--yes", "hotload-mcp@0.3.0", "serve"]
 ```
 
-Restart Codex once after adding the gateway. The gateway stays connected while you add and reload child servers.
-
-## Add your first server
-
-In a terminal, register the command that starts your MCP server. Replace the example path and command with your own.
+Restart Codex once after adding the gateway. Add child servers through the CLI:
 
 ```bash
-codex-mcp-hotload add my-server --cwd ~/Projects/my-server -- node dist/index.js
+hotload-mcp add my-server --cwd ~/Projects/my-server -- node dist/index.js
 ```
 
-Then ask Codex to search for the child server tools and call one. When you change its code, rebuild the child and ask Codex to reload it. The gateway reads its configuration when tools are called, so a new child becomes available without restarting Codex or the gateway.
+After changing a child, call `hotload_reload_server`, then search for its current tools with `hotload_search_tools`. Call them with `hotload_call_tool` and the current `schemaHash`. Hotload validates arguments and rejects missing or stale schema hashes.
 
-## What it supports
+## Connect Claude Code
 
-The gateway connects to local stdio servers and Streamable HTTP servers. It lists and searches their tools, checks arguments against the current schema, and detects when a saved schema is stale. It can watch files and rebuild a child when configured. If a stdio child exits unexpectedly, the gateway retries it with bounded backoff and reports its status. After the retry limit, calls using saved child details return a terminal error with the retry count and tell the model to stop calling until the child is manually reloaded.
-
-Tool hashes cover names, titles, descriptions, and input and output schemas. Reload results show the old and new tool details when something changes. Search for the tool before each call and pass the returned `schemaHash`. Calls without a hash or with an old hash are rejected.
-
-Codex native controls are available when Hotload can reach the app server control socket. By default it checks `$CODEX_HOME/app-server-control/app-server-control.sock`, or `~/.codex/app-server-control/app-server-control.sock` when `CODEX_HOME` is unset. If needed, set `codexControl.socketPath` or `codexControl.url` in the Hotload JSON configuration. A standard Desktop session may not expose this endpoint to an external process, so direct Codex discovery is optional and the gateway child features work without it.
-
-## Native Codex controls
-
-`hotload_list_servers` includes servers configured directly in Codex when the control endpoint is reachable. `hotload_server_status` reports their app server status. `hotload_reload_server` reloads one Hotload child or, when called without a `server`, reloads every Hotload child and requests `config/mcpServer/reload` for all Codex configured servers.
-
-For servers managed by Hotload, the gateway keeps a stable tool interface in the chat. After a reload, call `hotload_search_tools` again and then `hotload_call_tool` with the returned schema hash; this can use changed child tools without restarting Codex. To add or remove child servers, edit Hotload's JSON config and the gateway discovers those changes on its next tool call.
-
-For MCP servers configured directly in Codex, the reload request is global and Codex queues it for loaded threads' next active turn. Hotload reports that it queued the request, but cannot guarantee that the current chat's model tool catalog refreshed. To get same-chat dynamic access reliably, route those servers through Hotload instead of configuring them directly in Codex. This local gateway uses no paid relay or hosted service. Universal in-place replacement of Codex's own model tool schemas is not available through a supported API.
-
-Hotload writes one-line JSON catalog events to stderr. Reload events include the before and after tool counts, sorted added, removed, and changed tool names, revision, outcome, and duration. Removing a server from Hotload's config emits a separate removal event. Tool descriptions, schemas, call arguments, and credentials are not included.
+From the project directory, run:
 
 ```bash
-codex-mcp-hotload codex status
-codex-mcp-hotload codex reload --server codex-mcp-hotload
+hotload-mcp claude install
+hotload-mcp claude status
 ```
 
-In a chat, call `hotload_reload_server` with no arguments to reload all gateway children and request the Codex-wide refresh. Then search for changed child tools with `hotload_search_tools` and call them through `hotload_call_tool`.
+Install safely adds a `hotload-mcp` entry to `.mcp.json` at project scope. It preserves other MCP entries and refuses to replace a conflicting entry with the same name. Status checks for the `claude` executable, a parseable project config, and the expected package/version/command. In Claude Code, use `/mcp` to verify the connection.
 
-## Develop and verify
+To remove the project entry:
 
-Contributors need Node.js 20 or newer.
+```bash
+hotload-mcp claude uninstall
+```
+
+Uninstall removes only the recognized Hotload entry and preserves the rest of the config. Claude Code uses the same gateway tools as Codex:
+
+- `hotload_list_servers`
+- `hotload_search_tools`
+- `hotload_call_tool`
+- `hotload_reload_server`
+- `hotload_server_status`
+
+Reloading a child keeps the Claude conversation connected to Hotload. Search again after reload to discover changed tools, then call through the gateway with the new schema hash.
+
+### Claude Code smoke check
+
+1. Run `hotload-mcp claude install` and confirm the new project entry in `.mcp.json`.
+2. Start Claude Code and verify Hotload MCP in `/mcp`.
+3. Search for and call a child tool through Hotload.
+4. Change or rebuild the child, then call `hotload_reload_server`.
+5. Search again and call the updated or newly added child tool in the same conversation.
+
+## Reload and catalog behavior
+
+Intentional reloads mark the child as draining. New calls receive `RELOAD_IN_PROGRESS`; active calls can finish during the configured `reloadDrainTimeoutMs` window, which defaults to 5000 ms. When the window expires, Hotload aborts remaining requests, closes the old child connection to settle any requests the transport does not cancel, and starts the replacement. Interrupted calls return `CALL_INTERRUPTED_BY_RELOAD`. Calls active during an unexpected child disconnect return `CHILD_DISCONNECTED` and the child follows bounded recovery backoff.
+
+Child servers can also change their tool catalog without restarting. Hotload subscribes to child tool-list changes, fetches the updated catalog, atomically replaces that server's registry entries, increments its revision, and logs one concise catalog event. Hotload's own gateway tool list stays fixed.
+
+Set `reloadDrainTimeoutMs` per child to change the drain window:
+
+```json
+{
+  "version": 1,
+  "servers": {
+    "my-server": {
+      "transport": "stdio",
+      "command": "node",
+      "args": ["dist/index.js"],
+      "reloadDrainTimeoutMs": 5000
+    }
+  }
+}
+```
+
+Reload events are written to stderr as one-line JSON. They include tool counts, sorted added/removed/changed names, revision, outcome, and duration. Tool schemas, call arguments, and credentials are not logged.
+
+## Codex native controls
+
+When Hotload can reach the Codex app-server control socket, `hotload_list_servers` and `hotload_server_status` include directly configured Codex servers. `hotload_reload_server` can request Codex to reload its directly configured servers. Codex queues that refresh for a later active turn; the stable Hotload gateway remains the same-chat path for dynamic child tools.
+
+By default, Hotload checks `$CODEX_HOME/app-server-control/app-server-control.sock`, or `~/.codex/app-server-control/app-server-control.sock` when `CODEX_HOME` is unset. Set `codexControl.socketPath` or `codexControl.url` to use a different endpoint. These controls are optional.
+
+## Development and verification
 
 ```bash
 npm ci
 npm run typecheck
 npm test
 npm run build
-node scripts/e2e-app-server.mjs
+npm run test:e2e
 ```
 
-The end to end check starts an isolated Codex app server and two fixture MCPs, one configured directly in Codex and one registered through Hotload. It verifies direct server discovery and the global reload request, preserves the same thread, reloads an updated child, rejects a stale schema, and checks crash recovery. It does not make a model request or need a Codex account login.
+Unit tests cover drain completion, forced cancellation and recovery, same-process dynamic catalog updates, and Claude config merge/refusal/uninstall behavior. The Codex app-server end-to-end check covers same-thread gateway discovery, reload, stale-schema rejection, and crash recovery. The interactive Claude Code smoke check above requires Claude Code installed and is not part of automated tests.
 
 ## Security
 
-Only register child servers you trust because their commands run as your user. Keep credentials out of the configuration file and use environment variables for secrets. The gateway uses stdio and does not open a network listener.
+Only register child servers you trust because their commands run as your user. Keep credentials out of the configuration file and use environment variables for secrets. Hotload uses stdio and does not open a network listener.
 
 See [SECURITY.md](SECURITY.md) for more information.

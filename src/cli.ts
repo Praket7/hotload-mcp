@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
-import { readConfig, writeConfig } from './config.js';
+import { configPath, readConfig, writeConfig } from './config.js';
 import { Manager } from './manager.js';
 import { serve } from './server.js';
 import { nativeReload, nativeStatus } from './codex.js';
+import { claudeInstall, claudeStatus, claudeUninstall } from './claude.js';
 
-const program = new Command().name('codex-mcp-hotload').description('A stable MCP gateway for hot-reloading child MCP servers.').version('0.2.6');
-program.command('init').description('Create an empty configuration.').action(async () => { await writeConfig(await readConfig()); console.log('Created', process.env.CODEX_MCP_HOTLOAD_CONFIG ?? '~/.codex-mcp-hotload/config.json'); });
+const program = new Command().name('hotload-mcp').description('A stable MCP gateway for hot-reloading child MCP servers.').version('0.3.0');
+program.command('init').description('Create an empty configuration.').action(async () => { await writeConfig(await readConfig()); console.log('Created', configPath()); });
 program.command('add <name>').argument('[command...]').option('--cwd <path>').option('--watch <glob...>').option('--build <command>').description('Register a stdio child MCP server.').allowUnknownOption().action(async (name: string, command: string[], options) => {
   const config = await readConfig(); const split = command.indexOf('--'); const actual = split >= 0 ? command.slice(split + 1) : command;
   if (!actual.length) throw new Error('Provide the child command after --.');
@@ -31,6 +32,10 @@ nativeOptions(codex.command('reload')).action(async (options) => { const result 
 program.command('doctor').description('Check local prerequisites and configuration.').action(async () => {
   console.log(`Node ${process.versions.node} ${Number(process.versions.node.split('.')[0]) >= 20 ? '✓' : '✗ Node 20+ required'}`);
   const config = await readConfig(); console.log(`Configuration valid: ${Object.keys(config.servers).length} child server(s)`);
-  console.log(`Config path: ${process.env.CODEX_MCP_HOTLOAD_CONFIG ?? '~/.codex-mcp-hotload/config.json'}`);
+  console.log(`Config path: ${configPath()}`);
 });
+const claude = program.command('claude').description('Install or inspect Hotload MCP in Claude Code.');
+claude.command('install').description('Safely add Hotload MCP to the current project .mcp.json.').action(async () => console.log(JSON.stringify(await claudeInstall(), null, 2)));
+claude.command('status').description('Check Claude Code and this project MCP configuration.').action(async () => console.log(JSON.stringify(await claudeStatus(), null, 2)));
+claude.command('uninstall').description('Remove only the Hotload MCP entry from the current project .mcp.json.').action(async () => console.log(JSON.stringify(await claudeUninstall(), null, 2)));
 await program.parseAsync(process.argv);
